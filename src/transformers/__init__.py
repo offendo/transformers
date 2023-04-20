@@ -426,6 +426,7 @@ _import_structure = {
     "models.resnet": ["RESNET_PRETRAINED_CONFIG_ARCHIVE_MAP", "ResNetConfig"],
     "models.retribert": ["RETRIBERT_PRETRAINED_CONFIG_ARCHIVE_MAP", "RetriBertConfig", "RetriBertTokenizer"],
     "models.roberta": ["ROBERTA_PRETRAINED_CONFIG_ARCHIVE_MAP", "RobertaConfig", "RobertaTokenizer"],
+    "models.treeformer": ["TREEFORMER_PRETRAINED_CONFIG_ARCHIVE_MAP", "TreeformerConfig", "TreeformerTokenizer"],
     "models.roberta_prelayernorm": ["ROBERTA_PRELAYERNORM_PRETRAINED_CONFIG_ARCHIVE_MAP", "RobertaPreLayerNormConfig"],
     "models.roc_bert": ["ROC_BERT_PRETRAINED_CONFIG_ARCHIVE_MAP", "RoCBertConfig", "RoCBertTokenizer"],
     "models.roformer": ["ROFORMER_PRETRAINED_CONFIG_ARCHIVE_MAP", "RoFormerConfig", "RoFormerTokenizer"],
@@ -760,6 +761,7 @@ else:
     _import_structure["models.rembert"].append("RemBertTokenizerFast")
     _import_structure["models.retribert"].append("RetriBertTokenizerFast")
     _import_structure["models.roberta"].append("RobertaTokenizerFast")
+    _import_structure["models.treeformer"].append("TreeformerTokenizerFast")
     _import_structure["models.roformer"].append("RoFormerTokenizerFast")
     _import_structure["models.splinter"].append("SplinterTokenizerFast")
     _import_structure["models.squeezebert"].append("SqueezeBertTokenizerFast")
@@ -2288,6 +2290,19 @@ else:
             "RobertaPreTrainedModel",
         ]
     )
+    _import_structure["models.treeformer"].extend(
+        [
+            "TREEFORMER_PRETRAINED_MODEL_ARCHIVE_LIST",
+            "TreeformerForCausalLM",
+            "TreeformerForMaskedLM",
+            "TreeformerForMultipleChoice",
+            "TreeformerForQuestionAnswering",
+            "TreeformerForSequenceClassification",
+            "TreeformerForTokenClassification",
+            "TreeformerModel",
+            "TreeformerPreTrainedModel",
+        ]
+    )
     _import_structure["models.roberta_prelayernorm"].extend(
         [
             "ROBERTA_PRELAYERNORM_PRETRAINED_MODEL_ARCHIVE_LIST",
@@ -3310,6 +3325,20 @@ else:
             "TFRobertaPreTrainedModel",
         ]
     )
+    _import_structure["models.treeformer"].extend(
+        [
+            "TF_TREEFORMER_PRETRAINED_MODEL_ARCHIVE_LIST",
+            "TFTreeformerForCausalLM",
+            "TFTreeformerForMaskedLM",
+            "TFTreeformerForMultipleChoice",
+            "TFTreeformerForQuestionAnswering",
+            "TFTreeformerForSequenceClassification",
+            "TFTreeformerForTokenClassification",
+            "TFTreeformerMainLayer",
+            "TFTreeformerModel",
+            "TFTreeformerPreTrainedModel",
+        ]
+    )
     _import_structure["models.roberta_prelayernorm"].extend(
         [
             "TF_ROBERTA_PRELAYERNORM_PRETRAINED_MODEL_ARCHIVE_LIST",
@@ -3699,6 +3728,18 @@ else:
             "FlaxRobertaForTokenClassification",
             "FlaxRobertaModel",
             "FlaxRobertaPreTrainedModel",
+        ]
+    )
+    _import_structure["models.treeformer"].extend(
+        [
+            "FlaxTreeformerForCausalLM",
+            "FlaxTreeformerForMaskedLM",
+            "FlaxTreeformerForMultipleChoice",
+            "FlaxTreeformerForQuestionAnswering",
+            "FlaxTreeformerForSequenceClassification",
+            "FlaxTreeformerForTokenClassification",
+            "FlaxTreeformerModel",
+            "FlaxTreeformerPreTrainedModel",
         ]
     )
     _import_structure["models.roberta_prelayernorm"].extend(
@@ -4120,6 +4161,7 @@ if TYPE_CHECKING:
     from .models.resnet import RESNET_PRETRAINED_CONFIG_ARCHIVE_MAP, ResNetConfig
     from .models.retribert import RETRIBERT_PRETRAINED_CONFIG_ARCHIVE_MAP, RetriBertConfig, RetriBertTokenizer
     from .models.roberta import ROBERTA_PRETRAINED_CONFIG_ARCHIVE_MAP, RobertaConfig, RobertaTokenizer
+    from .models.treeformer import TREEFORMER_PRETRAINED_CONFIG_ARCHIVE_MAP, TreeformerConfig, TreeformerTokenizer
     from .models.roberta_prelayernorm import (
         ROBERTA_PRELAYERNORM_PRETRAINED_CONFIG_ARCHIVE_MAP,
         RobertaPreLayerNormConfig,
@@ -4430,6 +4472,7 @@ if TYPE_CHECKING:
         from .models.rembert import RemBertTokenizerFast
         from .models.retribert import RetriBertTokenizerFast
         from .models.roberta import RobertaTokenizerFast
+        from .models.treeformer import TreeformerTokenizerFast
         from .models.roformer import RoFormerTokenizerFast
         from .models.splinter import SplinterTokenizerFast
         from .models.squeezebert import SqueezeBertTokenizerFast
@@ -5671,6 +5714,17 @@ if TYPE_CHECKING:
             RobertaModel,
             RobertaPreTrainedModel,
         )
+        from .models.treeformer import (
+            TREEFORMER_PRETRAINED_MODEL_ARCHIVE_LIST,
+            TreeformerForCausalLM,
+            TreeformerForMaskedLM,
+            TreeformerForMultipleChoice,
+            TreeformerForQuestionAnswering,
+            TreeformerForSequenceClassification,
+            TreeformerForTokenClassification,
+            TreeformerModel,
+            TreeformerPreTrainedModel,
+        )
         from .models.roberta_prelayernorm import (
             ROBERTA_PRELAYERNORM_PRETRAINED_MODEL_ARCHIVE_LIST,
             RobertaPreLayerNormForCausalLM,
@@ -6498,6 +6552,18 @@ if TYPE_CHECKING:
             TFRobertaModel,
             TFRobertaPreTrainedModel,
         )
+        from .models.treeformer import (
+            TF_TREEFORMER_PRETRAINED_MODEL_ARCHIVE_LIST,
+            TFTreeformerForCausalLM,
+            TFTreeformerForMaskedLM,
+            TFTreeformerForMultipleChoice,
+            TFTreeformerForQuestionAnswering,
+            TFTreeformerForSequenceClassification,
+            TFTreeformerForTokenClassification,
+            TFTreeformerMainLayer,
+            TFTreeformerModel,
+            TFTreeformerPreTrainedModel,
+        )
         from .models.roberta_prelayernorm import (
             TF_ROBERTA_PRELAYERNORM_PRETRAINED_MODEL_ARCHIVE_LIST,
             TFRobertaPreLayerNormForCausalLM,
@@ -6793,6 +6859,16 @@ if TYPE_CHECKING:
             FlaxRobertaForTokenClassification,
             FlaxRobertaModel,
             FlaxRobertaPreTrainedModel,
+        )
+        from .models.treeformer import (
+            FlaxTreeformerForCausalLM,
+            FlaxTreeformerForMaskedLM,
+            FlaxTreeformerForMultipleChoice,
+            FlaxTreeformerForQuestionAnswering,
+            FlaxTreeformerForSequenceClassification,
+            FlaxTreeformerForTokenClassification,
+            FlaxTreeformerModel,
+            FlaxTreeformerPreTrainedModel,
         )
         from .models.roberta_prelayernorm import (
             FlaxRobertaPreLayerNormForCausalLM,
