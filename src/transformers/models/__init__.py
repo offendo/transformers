@@ -159,6 +159,7 @@ from . import (
     resnet,
     retribert,
     roberta,
+    oldtreeformer,
     roberta_prelayernorm,
     roc_bert,
     roformer,
