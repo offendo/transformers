@@ -7,6 +7,7 @@ from typing import Tuple, Union
 
 import torch
 import numpy as np
+from scipy.linalg import block_diag
 
 
 def pprint_tree(tree):
@@ -23,6 +24,10 @@ def pprint_tree(tree):
 
 def tree_size(N: int) -> int:
     return 2 * N - 1
+
+
+def seq_length_from_tree_size(W: int) -> int:
+    return (W + 1) // 2
 
 
 def tree_height(N: int) -> int:
@@ -73,21 +78,21 @@ def make_tree_pad_mask(seq_mask: np.ndarray) -> np.ndarray:
     B, N = seq_mask.shape
     W = tree_size(N)
     mask = np.zeros((B, W), dtype=bool)
-    seq_lengths = np.sum(seq_mask == 0, axis=1)
+    seq_lengths = np.sum(seq_mask == 1, axis=1)
 
     for b, L in enumerate(seq_lengths):
         row_lens = get_row_lens(L)
         starts = get_row_idxs(N, torch.arange(tree_height(N)))[:, 0]
         for row, row_len in enumerate(row_lens):
             start = starts[row]
-            mask[b, start : start + row_len] = seq_mask[b, :row_len]
+            mask[b, start : start + row_len] = 1
 
-    return mask
+    return mask # zero indicates pad
 
 
 @lru_cache
 def make_tree_attn_mask(N):
-    """Generate the attention mask for a sequence of length `N` padded to length `batch_max_N`
+    """Generate the attention mask for a sequence of length `N`.
 
     A cell in row `r` can attend to any cell in row `t <= r`.
     """
@@ -100,8 +105,22 @@ def make_tree_attn_mask(N):
         mask[start:, start:end] = 1  # allow attention
     return mask
 
+def batch_tree_attn_mask(*lengths):
+    masks = []
+    L = 0
+    for l in lengths:
+        m = block_diag(*map(make_tree_attn_mask, l))
+        masks.append(m)
+        L = max(L, len(m))
 
-def tree_masks(mask, device: torch.device = torch.device("cuda")):
+    B = len(lengths)
+    batch_mask = np.zeros((B, L, L))
+    for b, m in enumerate(masks):
+        n = m.shape[0]
+        batch_mask[b, :n, :n] = m
+    return batch_mask
+
+def tree_masks(mask, device: Union[torch.device, str] = "cuda"):
     """Builds tuple of `(attn_mask, pad_mask)`"""
 
     # convert to numpy if needed

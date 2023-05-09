@@ -14,14 +14,16 @@
 # limitations under the License.
 """Fast Tokenization classes for Treeformer."""
 import json
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Dict, Any
 
-from tokenizers import pre_tokenizers, processors
+from tokenizers import Encoding, pre_tokenizers, processors
+import numpy as np
 
-from ...tokenization_utils_base import AddedToken, BatchEncoding
+from ...tokenization_utils_base import AddedToken, BatchEncoding, EncodingFast
 from ...tokenization_utils_fast import PreTrainedTokenizerFast
 from ...utils import logging
 from .tokenization_treeformer import TreeformerTokenizer
+from .utils_treeformer import tree_masks
 
 
 logger = logging.get_logger(__name__)
@@ -261,8 +263,15 @@ class TreeformerTokenizerFast(PreTrainedTokenizerFast):
             f"You need to instantiate {self.__class__.__name__} with add_prefix_space=True "
             "to use it with pretokenized inputs."
         )
+        encoding = super()._batch_encode_plus(*args, **kwargs)
 
-        return super()._batch_encode_plus(*args, **kwargs)
+        # Add the treeformer specific masks
+        if kwargs.get('return_attention_mask', False):
+            attn_mask, pad_mask = tree_masks(np.array(encoding.attention_mask), "cpu")
+            setattr(encoding, "treeformer_mask", attn_mask)
+            setattr(encoding, "treeformer_pad_mask", pad_mask)
+
+        return encoding
 
     def _encode_plus(self, *args, **kwargs) -> BatchEncoding:
         is_split_into_words = kwargs.get("is_split_into_words", False)
@@ -272,7 +281,15 @@ class TreeformerTokenizerFast(PreTrainedTokenizerFast):
             "to use it with pretokenized inputs."
         )
 
-        return super()._encode_plus(*args, **kwargs)
+        encoding = super()._encode_plus(*args, **kwargs)
+
+        # Add the treeformer specific masks
+        if kwargs.get('return_attention_mask', False):
+            attn_mask, pad_mask = tree_masks(np.array(encoding.attention_mask)[None, :], "cpu")
+            setattr(encoding, "treeformer_mask", attn_mask)
+            setattr(encoding, "treeformer_pad_mask", pad_mask)
+
+        return encoding
 
     def save_vocabulary(self, save_directory: str, filename_prefix: Optional[str] = None) -> Tuple[str]:
         files = self._tokenizer.model.save(save_directory, name=filename_prefix)

@@ -45,7 +45,7 @@ from ...utils import (
     replace_return_docstrings,
 )
 from .configuration_treeformer import TreeformerConfig
-from .utils_treeformer import tree_height, tree_size, get_coords_from_idxs
+from .utils_treeformer import seq_length_from_tree_size, tree_height, tree_size, get_coords_from_idxs
 
 
 logger = logging.get_logger(__name__)
@@ -68,20 +68,19 @@ class PositionEmbedding2D(nn.Module):
         self.row_emb = nn.Embedding(max_height, embed_dim)
 
     def forward(self, src_tokens):
-        N, B = src_tokens.shape
-        W = tree_size(src_tokens.size(0))
+        N = src_tokens.size(1)
+        W = tree_size(N)
         rows_and_cols = get_coords_from_idxs(N, torch.arange(W, device=src_tokens.device))
         rows = rows_and_cols[:, 0]
         cols = rows_and_cols[:, 1]
 
-        col_embs = self.col_emb(cols.view(-1, 1))
-        row_embs = self.row_emb(rows.view(-1, 1))
+        col_embs = self.col_emb(cols.view(1, -1))
+        row_embs = self.row_emb(rows.view(1, -1))
 
         pos_embs = col_embs + row_embs
-        return pos_embs.view(W, 1, -1).expand(-1, B, -1)  # [W, B, D]
+        return pos_embs
 
 
-# Copied from transformers.models.roberta.modeling_roberta.RobertaEmbeddings with Roberta->Treeformer
 class TreeformerEmbeddings(nn.Module):
     """
     Same as BertEmbeddings with a tiny tweak for positional embeddings indexing.
@@ -90,7 +89,7 @@ class TreeformerEmbeddings(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.word_embeddings = nn.Embedding(config.vocab_size, config.hidden_size, padding_idx=config.pad_token_id)
-        self.position_embeddings = nn.Embedding(config.max_position_embeddings, config.hidden_size)
+        self.position_embeddings = PositionEmbedding2D(config.max_position_embeddings, config.hidden_size)
         self.token_type_embeddings = nn.Embedding(config.type_vocab_size, config.hidden_size)
 
         # self.LayerNorm is not snake-cased to stick with TensorFlow model variable name and be able to load
@@ -106,8 +105,6 @@ class TreeformerEmbeddings(nn.Module):
 
         # End copy
         self.padding_idx = config.pad_token_id
-        self.position_embeddings = PositionEmbedding2D(config.max_position_embeddings, config.hidden_size)
-        # self.position_embeddings = nn.Embedding(config.max_position_embeddings, config.hidden_size, padding_idx=self.padding_idx)
 
         self.position_ids: torch.Tensor
         self.token_type_ids: torch.Tensor
@@ -133,6 +130,7 @@ class TreeformerEmbeddings(nn.Module):
             input_shape = inputs_embeds.size()[:-1]
 
         seq_length = input_shape[1]
+        W = tree_size(seq_length)
 
         # Setting the token_type_ids to the registered buffer in constructor where it is all zeros, which usually occurs
         # when its auto-generated, registered buffer helps users when tracing the model without passing token_type_ids, solves
@@ -151,9 +149,9 @@ class TreeformerEmbeddings(nn.Module):
 
         embeddings = inputs_embeds + token_type_embeddings
         if self.position_embedding_type == "absolute":
+            embeddings = nn.functional.pad(embeddings, (0, 0, 0, W-seq_length, 0, 0), mode='constant', value=0)
             position_embeddings = self.position_embeddings(position_ids)
-            position_embeddings[:seq_length] += embeddings
-            # embeddings += position_embeddings
+            embeddings += position_embeddings
         embeddings = self.LayerNorm(embeddings)
         embeddings = self.dropout(embeddings)
         return embeddings
@@ -176,7 +174,6 @@ class TreeformerEmbeddings(nn.Module):
         return position_ids.unsqueeze(0).expand(input_shape)
 
 
-# Copied from transformers.models.bert.modeling_bert.BertSelfAttention with Bert->Treeformer
 class TreeformerSelfAttention(nn.Module):
     def __init__(self, config, position_embedding_type=None):
         super().__init__()
@@ -311,7 +308,6 @@ class TreeformerSelfAttention(nn.Module):
         return outputs
 
 
-# Copied from transformers.models.bert.modeling_bert.BertSelfOutput
 class TreeformerSelfOutput(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -326,7 +322,6 @@ class TreeformerSelfOutput(nn.Module):
         return hidden_states
 
 
-# Copied from transformers.models.bert.modeling_bert.BertAttention with Bert->Treeformer
 class TreeformerAttention(nn.Module):
     def __init__(self, config, position_embedding_type=None):
         super().__init__()
@@ -376,7 +371,6 @@ class TreeformerAttention(nn.Module):
         return outputs
 
 
-# Copied from transformers.models.bert.modeling_bert.BertIntermediate
 class TreeformerIntermediate(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -392,7 +386,6 @@ class TreeformerIntermediate(nn.Module):
         return hidden_states
 
 
-# Copied from transformers.models.bert.modeling_bert.BertOutput
 class TreeformerOutput(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -407,7 +400,6 @@ class TreeformerOutput(nn.Module):
         return hidden_states
 
 
-# Copied from transformers.models.bert.modeling_bert.BertLayer with Bert->Treeformer
 class TreeformerLayer(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -494,7 +486,6 @@ class TreeformerLayer(nn.Module):
         return layer_output
 
 
-# Copied from transformers.models.bert.modeling_bert.BertEncoder with Bert->Treeformer
 class TreeformerEncoder(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -521,7 +512,9 @@ class TreeformerEncoder(nn.Module):
 
         if self.gradient_checkpointing and self.training:
             if use_cache:
-                logger.warning_once("`use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`...")
+                logger.warning_once(
+                    "`use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`..."
+                )
                 use_cache = False
 
         next_decoder_cache = () if use_cache else None
@@ -591,7 +584,6 @@ class TreeformerEncoder(nn.Module):
         )
 
 
-# Copied from transformers.models.bert.modeling_bert.BertPooler
 class TreeformerPooler(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -601,14 +593,14 @@ class TreeformerPooler(nn.Module):
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # We "pool" the model by simply taking the hidden states corresponding to the first token
         # and the very top node (which corresponds to the sentence encoding)
-        first_token_tensor = hidden_states[:, 0]
-        top_node_tensor = hidden_states[:, -1]
-        pooled_output = self.dense(first_token_tensor + top_node_tensor)
+        # first_token_tensor = hidden_states[:, 0]
+        # pooled_output = self.dense(first_token_tensor)
+        root_node_tensor = hidden_states[:, -1]
+        pooled_output = self.dense(root_node_tensor)
         pooled_output = self.activation(pooled_output)
         return pooled_output
 
 
-# Copied from transformers.models.roberta.modeling_roberta.RobertaPreTrainedModel with Roberta->Treeformer,roberta->treeformer
 class TreeformerPreTrainedModel(PreTrainedModel):
     """
     An abstract class to handle weights initialization and a simple interface for downloading and loading pretrained
@@ -717,11 +709,7 @@ TREEFORMER_INPUTS_DOCSTRING = r"""
 """
 
 
-@add_start_docstrings(
-    "The bare Treeformer Model transformer outputting raw hidden-states without any specific head on top.",
-    TREEFORMER_START_DOCSTRING,
-)
-# Copied from transformers.models.roberta.modeling_roberta.RobertaModel with ROBERTA->TREEFORMER,Roberta->Treeformer
+@add_start_docstrings("The bare Treeformer Model transformer outputting raw hidden-states without any specific head on top.", TREEFORMER_START_DOCSTRING)
 class TreeformerModel(TreeformerPreTrainedModel):
     """
 
@@ -902,10 +890,7 @@ class TreeformerModel(TreeformerPreTrainedModel):
         )
 
 
-@add_start_docstrings(
-    """Treeformer Model with a `language modeling` head on top for CLM fine-tuning.""", TREEFORMER_START_DOCSTRING
-)
-# Copied from transformers.models.roberta.modeling_roberta.RobertaForCausalLM with ROBERTA->TREEFORMER,Roberta->Treeformer,roberta->treeformer,roberta-base->offendo/treeformer-base
+@add_start_docstrings("""Treeformer Model with a `language modeling` head on top for CLM fine-tuning.""", TREEFORMER_START_DOCSTRING)
 class TreeformerForCausalLM(TreeformerPreTrainedModel):
     _keys_to_ignore_on_save = [r"lm_head.decoder.weight", r"lm_head.decoder.bias"]
     _keys_to_ignore_on_load_missing = [r"position_ids", r"lm_head.decoder.weight", r"lm_head.decoder.bias"]
@@ -1060,7 +1045,6 @@ class TreeformerForCausalLM(TreeformerPreTrainedModel):
 
 
 @add_start_docstrings("""Treeformer Model with a `language modeling` head on top.""", TREEFORMER_START_DOCSTRING)
-# Copied from transformers.models.roberta.modeling_roberta.RobertaForMaskedLM with ROBERTA->TREEFORMER,Roberta->Treeformer,roberta->treeformer
 class TreeformerForMaskedLM(TreeformerPreTrainedModel):
     _keys_to_ignore_on_save = [r"lm_head.decoder.weight", r"lm_head.decoder.bias"]
     _keys_to_ignore_on_load_missing = [r"position_ids", r"lm_head.decoder.weight", r"lm_head.decoder.bias"]
@@ -1159,7 +1143,132 @@ class TreeformerForMaskedLM(TreeformerPreTrainedModel):
         )
 
 
-# Copied from transformers.models.roberta.modeling_roberta.RobertaLMHead with Roberta->Treeformer
+class TreeformerForDenoisingAutoEncoder(TreeformerPreTrainedModel):
+    _keys_to_ignore_on_save = [r"lm_head.decoder.weight", r"lm_head.decoder.bias"]
+    _keys_to_ignore_on_load_missing = [r"position_ids", r"lm_head.decoder.weight", r"lm_head.decoder.bias"]
+    _keys_to_ignore_on_load_unexpected = [r"pooler"]
+
+    def __init__(self, config):
+        super().__init__(config)
+
+        if config.is_decoder:
+            logger.warning(
+                "If you want to use `TreeformerForDenoisingAutoEncoder` make sure `config.is_decoder=False` for "
+                "bi-directional self-attention."
+            )
+
+        # Model (embedding + encoder)
+        self.treeformer = TreeformerModel(config, add_pooling_layer=False)
+
+        # Decoder (encoder acting as a decoder)
+        self.decoder = TreeformerEncoder(config)
+
+        # LM head to predict tokens again
+        self.lm_head = TreeformerLMHead(config)
+
+        # Create a mask for blocking out all but the last element (i.e., the sentence embedding).
+        max_tree_size = tree_size(config.max_position_embeddings)
+        self.register_buffer("decoder_mask", torch.zeros(max_tree_size).expand(1, -1), persistent=False)
+        self.decoder_mask: torch.Tensor
+        self.decoder_mask[:, -1] = 1  # 1
+
+        # The LM head weights require special treatment only when they are tied with the word embeddings
+        self.update_keys_to_ignore(config, ["lm_head.decoder.weight"])
+
+        # Initialize weights and apply final processing
+        self.post_init()
+
+    def get_output_embeddings(self):
+        return self.lm_head.decoder
+
+    def set_output_embeddings(self, new_embeddings):
+        self.lm_head.decoder = new_embeddings
+
+    @add_start_docstrings_to_model_forward(TREEFORMER_INPUTS_DOCSTRING.format("batch_size, sequence_length"))
+    @add_code_sample_docstrings(
+        checkpoint=_CHECKPOINT_FOR_DOC,
+        output_type=MaskedLMOutput,
+        config_class=_CONFIG_FOR_DOC,
+        mask="<mask>",
+        expected_output="' Paris'",
+        expected_loss=0.1,
+    )
+    def forward(
+        self,
+        input_ids: Optional[torch.LongTensor] = None,
+        attention_mask: Optional[torch.FloatTensor] = None,
+        token_type_ids: Optional[torch.LongTensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        head_mask: Optional[torch.FloatTensor] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        encoder_hidden_states: Optional[torch.FloatTensor] = None,
+        encoder_attention_mask: Optional[torch.FloatTensor] = None,
+        labels: Optional[torch.LongTensor] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+    ) -> Union[Tuple[torch.Tensor], MaskedLMOutput]:
+        r"""
+        labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
+            Labels for computing the masked language modeling loss. Indices should be in `[-100, 0, ...,
+            config.vocab_size]` (see `input_ids` docstring) Tokens with indices set to `-100` are ignored (masked), the
+            loss is only computed for the tokens with labels in `[0, ..., config.vocab_size]`
+        kwargs (`Dict[str, any]`, optional, defaults to *{}*):
+            Used to hide legacy arguments that have been deprecated.
+        """
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        outputs = self.treeformer(
+            input_ids,
+            attention_mask=attention_mask,
+            token_type_ids=token_type_ids,
+            position_ids=position_ids,
+            head_mask=head_mask,
+            inputs_embeds=inputs_embeds,
+            encoder_hidden_states=encoder_hidden_states,
+            encoder_attention_mask=encoder_attention_mask,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+        )
+        hidden_state = outputs[0]
+        # Mask out all but the sentence embedding
+        decoder_input = hidden_state * self.decoder_mask[:, : -hidden_state.size(1)]
+        decoder_output = self.decoder.forward(
+            hidden_states=decoder_input,
+            attention_mask=attention_mask,
+            head_mask=head_mask,
+            encoder_hidden_states=None,
+            encoder_attention_mask=None,
+            past_key_values=None,
+            use_cache=False,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+        )
+        sequence_output = decoder_output[0]
+
+        prediction_scores = self.lm_head(sequence_output)
+
+        autoencoder_loss = None
+        if labels is not None:
+            # move labels to correct device to enable model parallelism
+            labels = labels.to(prediction_scores.device)
+            loss_fct = CrossEntropyLoss()
+            autoencoder_loss = loss_fct(prediction_scores.view(-1, self.config.vocab_size), labels.view(-1))
+
+        if not return_dict:
+            output = (prediction_scores,) + outputs[2:]
+            return ((autoencoder_loss,) + output) if autoencoder_loss is not None else output
+
+        return MaskedLMOutput(
+            loss=autoencoder_loss,
+            logits=prediction_scores,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+        )
+
+
 class TreeformerLMHead(nn.Module):
     """Treeformer Head for masked language modeling."""
 
@@ -1173,7 +1282,9 @@ class TreeformerLMHead(nn.Module):
         self.decoder.bias = self.bias
 
     def forward(self, features, **kwargs):
-        x = self.dense(features)
+        B, W, D = features.shape
+        N = seq_length_from_tree_size(W)
+        x = self.dense(features[:N])
         x = gelu(x)
         x = self.layer_norm(x)
 
@@ -1198,7 +1309,6 @@ class TreeformerLMHead(nn.Module):
     """,
     TREEFORMER_START_DOCSTRING,
 )
-# Copied from transformers.models.roberta.modeling_roberta.RobertaForSequenceClassification with ROBERTA->TREEFORMER,Roberta->Treeformer,roberta->treeformer,roberta-base->offendo/treeformer-base
 class TreeformerForSequenceClassification(TreeformerPreTrainedModel):
     _keys_to_ignore_on_load_missing = [r"position_ids"]
 
@@ -1300,7 +1410,7 @@ class TreeformerForSequenceClassification(TreeformerPreTrainedModel):
     """,
     TREEFORMER_START_DOCSTRING,
 )
-# Copied from transformers.models.roberta.modeling_roberta.RobertaForMultipleChoice with ROBERTA->TREEFORMER,Roberta->Treeformer,roberta->treeformer
+
 
 @add_start_docstrings(
     """
@@ -1309,7 +1419,6 @@ class TreeformerForSequenceClassification(TreeformerPreTrainedModel):
     """,
     TREEFORMER_START_DOCSTRING,
 )
-# Copied from transformers.models.roberta.modeling_roberta.RobertaForTokenClassification with ROBERTA->TREEFORMER,Roberta->Treeformer,roberta->treeformer
 class TreeformerForTokenClassification(TreeformerPreTrainedModel):
     _keys_to_ignore_on_load_unexpected = [r"pooler"]
     _keys_to_ignore_on_load_missing = [r"position_ids"]
@@ -1370,9 +1479,10 @@ class TreeformerForTokenClassification(TreeformerPreTrainedModel):
             return_dict=return_dict,
         )
 
-        sequence_output = outputs[0]
-
-        sequence_output = self.dropout(sequence_output)
+        tree_output = outputs[0]
+        N = seq_length_from_tree_size(tree_output.size(1))
+        sequence_output = tree_output[:, :N, :]
+        tree_output = self.dropout(sequence_output)
         logits = self.classifier(sequence_output)
 
         loss = None
@@ -1394,7 +1504,6 @@ class TreeformerForTokenClassification(TreeformerPreTrainedModel):
         )
 
 
-# Copied from transformers.models.roberta.modeling_roberta.RobertaClassificationHead with Roberta->Treeformer
 class TreeformerClassificationHead(nn.Module):
     """Head for sentence-level classification tasks."""
 
@@ -1408,7 +1517,8 @@ class TreeformerClassificationHead(nn.Module):
         self.out_proj = nn.Linear(config.hidden_size, config.num_labels)
 
     def forward(self, features, **kwargs):
-        x = features[:, 0, :]  # take <s> token (equiv. to [CLS])
+        # x = features[:, 0, :]  # take <s> token (equiv. to [CLS])
+        x = features[:, -1, :]  # take the root node (our version of a sentence embedding)
         x = self.dropout(x)
         x = self.dense(x)
         x = torch.tanh(x)
@@ -1424,8 +1534,8 @@ class TreeformerClassificationHead(nn.Module):
     """,
     TREEFORMER_START_DOCSTRING,
 )
-# Copied from transformers.models.roberta.modeling_roberta.RobertaForQuestionAnswering with ROBERTA->TREEFORMER,Roberta->Treeformer,roberta->treeformer,roberta-base->offendo/treeformer-base
 class TreeformerForQuestionAnswering(TreeformerPreTrainedModel):
+    # TODO UNFINISHED
     _keys_to_ignore_on_load_unexpected = [r"pooler"]
     _keys_to_ignore_on_load_missing = [r"position_ids"]
 
@@ -1485,7 +1595,9 @@ class TreeformerForQuestionAnswering(TreeformerPreTrainedModel):
             return_dict=return_dict,
         )
 
-        sequence_output = outputs[0]
+        tree_output = outputs[0]
+        N = seq_length_from_tree_size(tree_output.size(1))
+        sequence_output = tree_output[:, :N]
 
         logits = self.qa_outputs(sequence_output)
         start_logits, end_logits = logits.split(1, dim=-1)
@@ -1536,3 +1648,9 @@ def create_position_ids_from_input_ids(input_ids, padding_idx, past_key_values_l
     mask = input_ids.ne(padding_idx).int()
     incremental_indices = (torch.cumsum(mask, dim=1).type_as(mask) + past_key_values_length) * mask
     return incremental_indices.long() + padding_idx
+
+
+
+emb = TreeformerEmbeddings(TreeformerConfig())
+input_ids = torch.arange(1,15).view(1, -1)
+emb.forward(input_ids)
