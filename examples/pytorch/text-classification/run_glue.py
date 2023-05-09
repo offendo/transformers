@@ -67,6 +67,18 @@ task_to_keys = {
     "wnli": ("sentence1", "sentence2"),
 }
 
+task_to_metrics = {
+    "cola": "matthews_correlation",
+    "mnli": "accuracy",
+    "mrpc": "f1",
+    "qnli": "accuracy",
+    "qqp": "f1",
+    "rte": "accuracy",
+    "sst2": "accuracy",
+    "stsb": "pearson_corr",
+    "wnli": "accuracy",
+}
+
 logger = logging.getLogger(__name__)
 
 
@@ -204,6 +216,10 @@ class ModelArguments:
     ignore_mismatched_sizes: bool = field(
         default=False,
         metadata={"help": "Will enable to load a pretrained model whose head dimensions are different."},
+    )
+    treeformer: bool = field(
+        default=False,
+        metadata={"help": "Enable treeformer"},
     )
     pool_cls_and_top: bool = field(
         default=False,
@@ -378,27 +394,29 @@ def main():
         revision=model_args.model_revision,
         use_auth_token=True if model_args.use_auth_token else None,
     )
-    # model = AutoModelForSequenceClassification.from_pretrained(
-    #     model_args.model_name_or_path,
-    #     from_tf=bool(".ckpt" in model_args.model_name_or_path),
-    #     config=config,
-    #     cache_dir=model_args.cache_dir,
-    #     revision=model_args.model_revision,
-    #     use_auth_token=True if model_args.use_auth_token else None,
-    #     ignore_mismatched_sizes=model_args.ignore_mismatched_sizes,
-    # )
-    config = OldTreeformerConfig.from_pretrained(
-        model_args.config_name if model_args.config_name else model_args.model_name_or_path,
-        num_labels=num_labels,
-        finetuning_task=data_args.task_name,
-        cache_dir=model_args.cache_dir,
-        revision=model_args.model_revision,
-        use_auth_token=True if model_args.use_auth_token else None,
-        pool_cls_and_top=model_args.pool_cls_and_top,
-    )
-    model = OldTreeformerForSequenceClassification(config)
-    missing, unexp = model.oldtreeformer.load_state_dict(torch.load('./roberta-weights.pt'), strict=False)
-    print(f'Missing these weights from state dict: {missing}')
+    if model_args.treeformer:
+        config = OldTreeformerConfig.from_pretrained(
+            model_args.config_name if model_args.config_name else model_args.model_name_or_path,
+            num_labels=num_labels,
+            finetuning_task=data_args.task_name,
+            cache_dir=model_args.cache_dir,
+            revision=model_args.model_revision,
+            use_auth_token=True if model_args.use_auth_token else None,
+            pool_cls_and_top=model_args.pool_cls_and_top,
+        )
+        model = OldTreeformerForSequenceClassification(config)
+        missing, unexp = model.oldtreeformer.load_state_dict(torch.load('./roberta-weights.pt'), strict=False)
+        print(f'Missing these weights from state dict: {missing}')
+    else:
+        model = AutoModelForSequenceClassification.from_pretrained(
+            model_args.model_name_or_path,
+            from_tf=bool(".ckpt" in model_args.model_name_or_path),
+            config=config,
+            cache_dir=model_args.cache_dir,
+            revision=model_args.model_revision,
+            use_auth_token=True if model_args.use_auth_token else None,
+            ignore_mismatched_sizes=model_args.ignore_mismatched_sizes,
+        )
 
 
     # Preprocessing the raw_datasets
@@ -532,6 +550,8 @@ def main():
         data_collator = None
 
     # Initialize our Trainer
+    if training_args.load_best_model_at_end:
+        training_args.metric_for_best_model = task_to_metrics[data_args.task_name]
     trainer = Trainer(
         model=model,
         args=training_args,
