@@ -103,6 +103,8 @@ class OldTreeformerConfig(PretrainedConfig):
         self,
         vocab_size=30522,
         hidden_size=768,
+        pool_cls_and_top=False,
+        max_height=10,
         num_hidden_layers=12,
         num_attention_heads=12,
         intermediate_size=3072,
@@ -122,6 +124,9 @@ class OldTreeformerConfig(PretrainedConfig):
         **kwargs,
     ):
         super().__init__(pad_token_id=pad_token_id, bos_token_id=bos_token_id, eos_token_id=eos_token_id, **kwargs)
+
+        self.max_height = max_height
+        self.pool_cls_and_top = pool_cls_and_top
 
         self.vocab_size = vocab_size
         self.hidden_size = hidden_size

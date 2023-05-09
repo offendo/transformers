@@ -26,12 +26,15 @@ from typing import Optional
 import datasets
 import evaluate
 import numpy as np
+import torch
 from datasets import load_dataset
 
 import transformers
 from transformers import (
     AutoConfig,
     AutoModelForSequenceClassification,
+    OldTreeformerForSequenceClassification,
+    OldTreeformerConfig,
     AutoTokenizer,
     DataCollatorWithPadding,
     EvalPrediction,
@@ -197,9 +200,14 @@ class ModelArguments:
             )
         },
     )
+
     ignore_mismatched_sizes: bool = field(
         default=False,
         metadata={"help": "Will enable to load a pretrained model whose head dimensions are different."},
+    )
+    pool_cls_and_top: bool = field(
+        default=False,
+        metadata={"help": "If True, will use cls and top row tokens"},
     )
 
 
@@ -370,15 +378,28 @@ def main():
         revision=model_args.model_revision,
         use_auth_token=True if model_args.use_auth_token else None,
     )
-    model = AutoModelForSequenceClassification.from_pretrained(
-        model_args.model_name_or_path,
-        from_tf=bool(".ckpt" in model_args.model_name_or_path),
-        config=config,
+    # model = AutoModelForSequenceClassification.from_pretrained(
+    #     model_args.model_name_or_path,
+    #     from_tf=bool(".ckpt" in model_args.model_name_or_path),
+    #     config=config,
+    #     cache_dir=model_args.cache_dir,
+    #     revision=model_args.model_revision,
+    #     use_auth_token=True if model_args.use_auth_token else None,
+    #     ignore_mismatched_sizes=model_args.ignore_mismatched_sizes,
+    # )
+    config = OldTreeformerConfig.from_pretrained(
+        model_args.config_name if model_args.config_name else model_args.model_name_or_path,
+        num_labels=num_labels,
+        finetuning_task=data_args.task_name,
         cache_dir=model_args.cache_dir,
         revision=model_args.model_revision,
         use_auth_token=True if model_args.use_auth_token else None,
-        ignore_mismatched_sizes=model_args.ignore_mismatched_sizes,
+        pool_cls_and_top=model_args.pool_cls_and_top,
     )
+    model = OldTreeformerForSequenceClassification(config)
+    missing, unexp = model.oldtreeformer.load_state_dict(torch.load('./roberta-weights.pt'), strict=False)
+    print(f'Missing these weights from state dict: {missing}')
+
 
     # Preprocessing the raw_datasets
     if data_args.task_name is not None:

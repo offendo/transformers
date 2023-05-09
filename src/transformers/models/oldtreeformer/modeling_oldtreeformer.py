@@ -17,6 +17,7 @@
 
 import math
 from typing import List, Optional, Tuple, Union
+from pathlib import Path
 
 import torch
 import torch.utils.checkpoint
@@ -45,6 +46,8 @@ from ...utils import (
 )
 from .configuration_oldtreeformer import OldTreeformerConfig
 
+from .utils import *
+
 
 logger = logging.get_logger(__name__)
 
@@ -55,6 +58,167 @@ OLDTREEFORMER_PRETRAINED_MODEL_ARCHIVE_LIST = [
     "",
     # See all OldTreeformer models at https://huggingface.co/models?filter=oldtreeformer
 ]
+
+class TreeBuilder(nn.Module):
+    """Treeformer module. Constructs a tree-like structure over an input text via a CKY-style encoding algorithm
+
+    Attributes
+    ----------
+    max_height : int
+
+    Submodules
+    ----------
+    attn : MultiheadAttention
+    combiner : nn.Linear
+    dropout : nn.Dropout
+    ff : nn.Sequential
+        - Linear -> ReLU -> Dropout -> Linear
+    norm_1, norm_2, norm_3 : nn.LayerNorm
+
+    """
+
+    def __init__(self, config):
+        super().__init__()
+
+        hidden_dim = config.hidden_size
+        intermediate_dim = config.intermediate_size
+        dropout = config.hidden_dropout_prob
+        attn_dropout = config.attention_probs_dropout_prob
+        self.max_height = config.max_height
+        self.save_attn = getattr(config, 'save_attn', False)
+        if self.save_attn:
+            Path(self.save_attn).mkdir(exist_ok=True, parents=True)
+
+        # Encoder
+        self.vp = nn.Parameter(torch.normal(mean=0.0, std=0.02, size=(hidden_dim,)))
+        self.attn = nn.MultiheadAttention(
+            hidden_dim,
+            num_heads=config.num_attention_heads,
+            dropout=attn_dropout,
+            batch_first=True,
+        )
+        self.combiner = nn.Linear(2 * hidden_dim, hidden_dim)
+        self.dropout = nn.Dropout(dropout)
+        self.ff = nn.Sequential(
+            nn.Linear(hidden_dim, intermediate_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(intermediate_dim, hidden_dim),
+        )
+        self.norm_1 = nn.LayerNorm(hidden_dim)
+        self.norm_2 = nn.LayerNorm(hidden_dim)
+        self.norm_3 = nn.LayerNorm(hidden_dim)
+        self.batch_idx = 0
+
+    def forward(self, embeddings: torch.Tensor, mask: torch.Tensor, src_tokens: torch.Tensor):
+        device = embeddings.device
+        B, N, D = embeddings.shape
+        W = get_tree_width(N, self.max_height)
+
+        tree = torch.zeros(size=(B, W, D), device=device)
+
+        # first row of the tree is transformer'd embeddings
+        tree[:, :N, :] = embeddings
+        tree_mask = make_tree_pad_mask(mask, H=self.max_height)
+
+        # Encode cells from the bottom up
+        all_weights = []
+        all_masks = []
+        for row in range(1, min(N, self.max_height)):
+            # make attention mask
+            row_len = N - row
+            ones = torch.ones(row, dtype=torch.bool, device=device)
+            attn_mask = ~torch.block_diag(*[ones for _ in range(row_len)])
+
+            left, right = self.get_children(tree, row, N)
+            row_output = self.encode_row(row_len, left, right, attn_mask)
+            start, end = get_row_idxs(N, row)
+            tree[:, start:end, :] = row_output[0]
+            if self.save_attn:
+                weights = row_output[1]
+                all_weights.append(weights.detach().cpu().numpy())
+                all_masks.append(attn_mask.detach().cpu().numpy())
+
+        # zero out the padding items
+        tree = tree * tree_mask.unsqueeze(-1)
+
+        # if self.save_attn:
+        #     with open(f"./weights-and-masks/{self.batch_idx}.pt", "wb") as f:
+        #         pickle.dump((all_weights, all_masks, src_tokens), f)
+        #     self.batch_idx += 1
+
+        return {
+            "tree": tree,
+            "tree_mask": tree_mask,
+        }
+
+    def encode_row(
+        self,
+        out_len: int,
+        left: torch.Tensor,
+        right: torch.Tensor,
+        attn_mask: Optional[torch.Tensor] = None,
+    ):
+        B, _, _ = left.shape
+
+        # norm + combine
+        left = self.norm_1(left)
+        right = self.norm_1(right)
+        pairs = self.combine(left, right)  # [B, N * row_len, D]
+
+        # norm + attn + dropout + add
+        src = self.vp.view(1, 1, -1).expand(B, out_len, -1)  # shape b, l, d
+        pairs = self.norm_2(pairs)
+        attn, weights = self.attn(
+            query=src,
+            key=pairs,
+            value=pairs,
+            key_padding_mask=None,
+            attn_mask=attn_mask,
+            need_weights=True,
+        )
+        src = src + self.dropout(attn)
+
+        # norm + (ff + dropout) + add
+        src = self.norm_3(src)
+        src = src + self.ff(src)
+        if self.save_attn:
+            # weights will be [B, row_len]
+            return (src, weights)
+        return src
+
+    def combine(self, v: torch.Tensor, u: torch.Tensor) -> torch.Tensor:
+        return v + u + self.combiner(torch.cat([v, u], dim=-1))
+
+    def get_children(
+        self, tree: torch.Tensor, row: int, N: int
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        row_len = N - row
+
+        left_idxs: List[int] = []
+        right_idxs: List[int] = []
+
+        for col in range(row_len):
+            lefts, rights = self.child_pair_indices(N, row, col)
+            left_idxs.extend(lefts)
+            right_idxs.extend(rights)
+
+        lefts = torch.index_select(
+            tree, dim=1, index=torch.tensor(left_idxs, device=tree.device, dtype=torch.long)
+        )
+        rights = torch.index_select(
+            tree, dim=1, index=torch.tensor(right_idxs, device=tree.device, dtype=torch.long)
+        )
+        return lefts, rights
+
+    @staticmethod
+    def child_pair_indices(N: int, row: int, col: int) -> Tuple[List[int], List[int]]:
+        left_idxs: List[int] = []
+        right_idxs: List[int] = []
+        for r in range(row):
+            left_idxs.append(get_idx_from_coord(N, (r, col)))
+            right_idxs.append(get_idx_from_coord(N, (row - r - 1, col + r + 1)))
+        return left_idxs, right_idxs
 
 
 
@@ -568,12 +732,19 @@ class OldTreeformerPooler(nn.Module):
         super().__init__()
         self.dense = nn.Linear(config.hidden_size, config.hidden_size)
         self.activation = nn.Tanh()
+        self.pool_cls_and_top = getattr(config, 'pool_cls_and_top', False)
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        # We "pool" the model by simply taking the hidden state corresponding
-        # to the first token.
+    def forward(self, hidden_states: torch.Tensor, N: int, H: int) -> torch.Tensor:
         first_token_tensor = hidden_states[:, 0]
-        pooled_output = self.dense(first_token_tensor)
+
+        height = min(H, N)
+        top_row_start_idx = tri(N) - tri(N - height + 1)
+        x = torch.mean(features[:, top_row_start_idx:, :], dim=1)
+
+        if self.pool_cls_and_top:
+            x = x + first_token_tensor
+
+        pooled_output = self.dense(x)
         pooled_output = self.activation(pooled_output)
         return pooled_output
 
@@ -719,6 +890,8 @@ class OldTreeformerModel(OldTreeformerPreTrainedModel):
 
         self.pooler = OldTreeformerPooler(config) if add_pooling_layer else None
 
+        self.tree_builder = TreeBuilder(config)
+
         # Initialize weights and apply final processing
         self.post_init()
 
@@ -857,13 +1030,16 @@ class OldTreeformerModel(OldTreeformerPreTrainedModel):
             return_dict=return_dict,
         )
         sequence_output = encoder_outputs[0]
-        pooled_output = self.pooler(sequence_output) if self.pooler is not None else None
+
+        tree_output = self.tree_builder(sequence_output, attention_mask, None)['tree']
+
+        pooled_output = self.pooler(tree_output) if self.pooler is not None else None
 
         if not return_dict:
             return (sequence_output, pooled_output) + encoder_outputs[1:]
 
         return BaseModelOutputWithPoolingAndCrossAttentions(
-            last_hidden_state=sequence_output,
+            last_hidden_state=tree_output,
             pooler_output=pooled_output,
             past_key_values=encoder_outputs.past_key_values,
             hidden_states=encoder_outputs.hidden_states,
@@ -984,7 +1160,9 @@ class OldTreeformerForCausalLM(OldTreeformerPreTrainedModel):
             return_dict=return_dict,
         )
 
-        sequence_output = outputs[0]
+        tree_output = outputs[0]
+        N = input_ids.size(1)
+        sequence_output = tree_output[:, :N, :]
         prediction_scores = self.lm_head(sequence_output)
 
         lm_loss = None
@@ -1107,7 +1285,9 @@ class OldTreeformerForMaskedLM(OldTreeformerPreTrainedModel):
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
         )
-        sequence_output = outputs[0]
+        tree_output = outputs[0]
+        N = input_ids.size(1)
+        sequence_output = tree_output[:, :N, :]
         prediction_scores = self.lm_head(sequence_output)
 
         masked_lm_loss = None
@@ -1223,8 +1403,11 @@ class OldTreeformerForSequenceClassification(OldTreeformerPreTrainedModel):
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
         )
-        sequence_output = outputs[0]
-        logits = self.classifier(sequence_output)
+        tree_output = outputs[0]
+        N = input_ids.size(1)
+        H = self.config.max_height
+        sequence_output = tree_output[:, :N, :]
+        logits = self.classifier(tree_output, N, H)
 
         loss = None
         if labels is not None:
@@ -1423,7 +1606,9 @@ class OldTreeformerForTokenClassification(OldTreeformerPreTrainedModel):
             return_dict=return_dict,
         )
 
-        sequence_output = outputs[0]
+        tree_output = outputs[0]
+        N = input_ids.size(1)
+        sequence_output = tree_output[:, :N, :]
 
         sequence_output = self.dropout(sequence_output)
         logits = self.classifier(sequence_output)
@@ -1459,9 +1644,16 @@ class OldTreeformerClassificationHead(nn.Module):
         )
         self.dropout = nn.Dropout(classifier_dropout)
         self.out_proj = nn.Linear(config.hidden_size, config.num_labels)
+        self.pool_cls_and_top = getattr(config, 'pool_cls_and_top', False)
 
-    def forward(self, features, **kwargs):
-        x = features[:, 0, :]  # take <s> token (equiv. to [CLS])
+    def forward(self, features, N, H, **kwargs):
+        height = min(H, N)
+        top_row_start_idx = tri(N) - tri(N - height + 1)
+        x = torch.mean(features[:, top_row_start_idx:, :], dim=1)
+
+        if self.pool_cls_and_top:
+            x = x + features[:, 0, :]
+
         x = self.dropout(x)
         x = self.dense(x)
         x = torch.tanh(x)
