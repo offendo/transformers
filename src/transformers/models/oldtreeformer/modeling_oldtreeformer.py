@@ -119,6 +119,7 @@ class TreeBuilder(nn.Module):
         src_tokens: Optional[torch.Tensor] = None,
         split_sentences_at: Optional[torch.LongTensor] = None,
     ):
+        # mask: 0 indicates padding
         device = embeddings.device
         B, N, D = embeddings.shape
         W = get_tree_width(N, self.max_height)

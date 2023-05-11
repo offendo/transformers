@@ -73,7 +73,7 @@ def make_tree_pad_mask(seq_mask: torch.Tensor, H: int, split_at: Optional[torch.
     Parameters
     ----------
     seq_mask : torch.Tensor, shape `[B, N]`
-        Mask for some sequence, where `True` indicates padding
+        Mask for some sequence, where `False` indicates padding
 
     Returns
     -------
@@ -82,7 +82,7 @@ def make_tree_pad_mask(seq_mask: torch.Tensor, H: int, split_at: Optional[torch.
     """
     B, N = seq_mask.shape
     W = get_tree_width(N, H)
-    tree_mask = torch.zeros(size=(B, W), device=seq_mask.device, dtype=torch.bool)
+    tree_mask = torch.ones(size=(B, W), device=seq_mask.device, dtype=torch.bool)
     tree_mask[:, :N] = seq_mask
     for row in range(1, min(N, H)):
         start, end = get_row_idxs(N, row)
@@ -102,7 +102,7 @@ def make_tree_pad_mask(seq_mask: torch.Tensor, H: int, split_at: Optional[torch.
                 start1, end1 = get_row_idxs(N, row)
 
                 # Mask out the in-between part
-                tree_mask[b, start1+row_len_1:start1+l1] = True
+                tree_mask[b, start1+row_len_1:start1+l1] = False
 
     return tree_mask
 
