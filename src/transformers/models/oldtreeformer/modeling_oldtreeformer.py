@@ -18,6 +18,7 @@
 import math
 from typing import List, Optional, Tuple, Union
 from pathlib import Path
+import pickle
 
 import torch
 import torch.utils.checkpoint
@@ -59,6 +60,7 @@ OLDTREEFORMER_PRETRAINED_MODEL_ARCHIVE_LIST = [
     # See all OldTreeformer models at https://huggingface.co/models?filter=oldtreeformer
 ]
 
+
 class TreeBuilder(nn.Module):
     """Treeformer module. Constructs a tree-like structure over an input text via a CKY-style encoding algorithm
 
@@ -85,7 +87,7 @@ class TreeBuilder(nn.Module):
         dropout = config.hidden_dropout_prob
         attn_dropout = config.attention_probs_dropout_prob
         self.max_height = config.max_height
-        self.save_attn = getattr(config, 'save_attn', False)
+        self.save_attn = getattr(config, "save_attn", False)
         if self.save_attn:
             Path(self.save_attn).mkdir(exist_ok=True, parents=True)
 
@@ -110,7 +112,13 @@ class TreeBuilder(nn.Module):
         self.norm_3 = nn.LayerNorm(hidden_dim)
         self.batch_idx = 0
 
-    def forward(self, embeddings: torch.Tensor, mask: torch.Tensor, src_tokens: torch.Tensor):
+    def forward(
+        self,
+        embeddings: torch.Tensor,
+        mask: torch.Tensor,
+        src_tokens: Optional[torch.Tensor] = None,
+        split_sentences_at: Optional[torch.LongTensor] = None,
+    ):
         device = embeddings.device
         B, N, D = embeddings.shape
         W = get_tree_width(N, self.max_height)
@@ -119,7 +127,7 @@ class TreeBuilder(nn.Module):
 
         # first row of the tree is transformer'd embeddings
         tree[:, :N, :] = embeddings
-        tree_mask = make_tree_pad_mask(mask, H=self.max_height)
+        tree_mask = make_tree_pad_mask(mask, H=self.max_height, split_at=split_sentences_at)
 
         # Encode cells from the bottom up
         all_weights = []
@@ -135,17 +143,16 @@ class TreeBuilder(nn.Module):
             start, end = get_row_idxs(N, row)
             tree[:, start:end, :] = row_output[0]
             if self.save_attn:
-                weights = row_output[1]
-                all_weights.append(weights.detach().cpu().numpy())
+                all_weights.append(row_output[1].detach().cpu().numpy())
                 all_masks.append(attn_mask.detach().cpu().numpy())
 
         # zero out the padding items
         tree = tree * tree_mask.unsqueeze(-1)
 
-        # if self.save_attn:
-        #     with open(f"./weights-and-masks/{self.batch_idx}.pt", "wb") as f:
-        #         pickle.dump((all_weights, all_masks, src_tokens), f)
-        #     self.batch_idx += 1
+        if self.save_attn:
+            with open(f"./weights-and-masks/{self.batch_idx}.pt", "wb") as f:
+                pickle.dump((all_weights, all_masks, src_tokens), f)
+            self.batch_idx += 1
 
         return {
             "tree": tree,
@@ -190,9 +197,7 @@ class TreeBuilder(nn.Module):
     def combine(self, v: torch.Tensor, u: torch.Tensor) -> torch.Tensor:
         return v + u + self.combiner(torch.cat([v, u], dim=-1))
 
-    def get_children(
-        self, tree: torch.Tensor, row: int, N: int
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    def get_children(self, tree: torch.Tensor, row: int, N: int) -> Tuple[torch.Tensor, torch.Tensor]:
         row_len = N - row
 
         left_idxs: List[int] = []
@@ -203,12 +208,8 @@ class TreeBuilder(nn.Module):
             left_idxs.extend(lefts)
             right_idxs.extend(rights)
 
-        lefts = torch.index_select(
-            tree, dim=1, index=torch.tensor(left_idxs, device=tree.device, dtype=torch.long)
-        )
-        rights = torch.index_select(
-            tree, dim=1, index=torch.tensor(right_idxs, device=tree.device, dtype=torch.long)
-        )
+        lefts = torch.index_select(tree, dim=1, index=torch.tensor(left_idxs, device=tree.device, dtype=torch.long))
+        rights = torch.index_select(tree, dim=1, index=torch.tensor(right_idxs, device=tree.device, dtype=torch.long))
         return lefts, rights
 
     @staticmethod
@@ -219,7 +220,6 @@ class TreeBuilder(nn.Module):
             left_idxs.append(get_idx_from_coord(N, (r, col)))
             right_idxs.append(get_idx_from_coord(N, (row - r - 1, col + r + 1)))
         return left_idxs, right_idxs
-
 
 
 # Copied from transformers.models.roberta.modeling_roberta.RobertaEmbeddings with Roberta->OldTreeformer
@@ -732,14 +732,14 @@ class OldTreeformerPooler(nn.Module):
         super().__init__()
         self.dense = nn.Linear(config.hidden_size, config.hidden_size)
         self.activation = nn.Tanh()
-        self.pool_cls_and_top = getattr(config, 'pool_cls_and_top', False)
+        self.pool_cls_and_top = getattr(config, "pool_cls_and_top", False)
 
     def forward(self, hidden_states: torch.Tensor, N: int, H: int) -> torch.Tensor:
         first_token_tensor = hidden_states[:, 0]
 
         height = min(H, N)
         top_row_start_idx = tri(N) - tri(N - height + 1)
-        x = torch.mean(features[:, top_row_start_idx:, :], dim=1)
+        x = torch.mean(hidden_states[:, top_row_start_idx:, :], dim=1)
 
         if self.pool_cls_and_top:
             x = x + first_token_tensor
@@ -930,6 +930,7 @@ class OldTreeformerModel(OldTreeformerPreTrainedModel):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
+        split_sentences_at: Optional[torch.LongTensor] = None,
     ) -> Union[Tuple[torch.Tensor], BaseModelOutputWithPoolingAndCrossAttentions]:
         r"""
         encoder_hidden_states  (`torch.FloatTensor` of shape `(batch_size, sequence_length, hidden_size)`, *optional*):
@@ -1029,10 +1030,21 @@ class OldTreeformerModel(OldTreeformerPreTrainedModel):
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
         )
-        sequence_output = encoder_outputs[0]
 
-        tree_output = self.tree_builder(sequence_output, attention_mask, None)['tree']
+        sequence_output = encoder_outputs[0]  # [B, N, D]
 
+        # If the input was actually a sentence pair, we want to split the two sentences in half to
+        # encode them separately. In practice, we can do this by just encoding them together and
+        # masking out the nodes which span both sentences. For example, if 0s are the first
+        # sentence and 1s are the second, we'd want the following tree structure to be built.
+        # 0 . . . 1 . . .
+        # 0 0 . . 1 1 . .
+        # 0 0 0 . 1 1 1 .
+        # 0 0 0 0 1 1 1 1
+        # where . represents padding
+        new_attn_mask = torch.zeros_like(attention_mask, device=attention_mask.device)
+
+        tree_output = self.tree_builder(sequence_output, attention_mask, None, split_sentences_at)["tree"]
         pooled_output = self.pooler(tree_output) if self.pooler is not None else None
 
         if not return_dict:
@@ -1049,7 +1061,8 @@ class OldTreeformerModel(OldTreeformerPreTrainedModel):
 
 
 @add_start_docstrings(
-    """OldTreeformer Model with a `language modeling` head on top for CLM fine-tuning.""", OLDTREEFORMER_START_DOCSTRING
+    """OldTreeformer Model with a `language modeling` head on top for CLM fine-tuning.""",
+    OLDTREEFORMER_START_DOCSTRING,
 )
 # Copied from transformers.models.roberta.modeling_roberta.RobertaForCausalLM with ROBERTA->OLDTREEFORMER,Roberta->OldTreeformer,roberta->oldtreeformer,roberta-base->
 class OldTreeformerForCausalLM(OldTreeformerPreTrainedModel):
@@ -1467,7 +1480,9 @@ class OldTreeformerForMultipleChoice(OldTreeformerPreTrainedModel):
         # Initialize weights and apply final processing
         self.post_init()
 
-    @add_start_docstrings_to_model_forward(OLDTREEFORMER_INPUTS_DOCSTRING.format("batch_size, num_choices, sequence_length"))
+    @add_start_docstrings_to_model_forward(
+        OLDTREEFORMER_INPUTS_DOCSTRING.format("batch_size, num_choices, sequence_length")
+    )
     @add_code_sample_docstrings(
         checkpoint=_CHECKPOINT_FOR_DOC,
         output_type=MultipleChoiceModelOutput,
@@ -1644,7 +1659,7 @@ class OldTreeformerClassificationHead(nn.Module):
         )
         self.dropout = nn.Dropout(classifier_dropout)
         self.out_proj = nn.Linear(config.hidden_size, config.num_labels)
-        self.pool_cls_and_top = getattr(config, 'pool_cls_and_top', False)
+        self.pool_cls_and_top = getattr(config, "pool_cls_and_top", False)
 
     def forward(self, features, N, H, **kwargs):
         height = min(H, N)
@@ -1660,6 +1675,86 @@ class OldTreeformerClassificationHead(nn.Module):
         x = self.dropout(x)
         x = self.out_proj(x)
         return x
+
+
+class OldTreeformerForSentenceOrderPrediction(OldTreeformerPreTrainedModel):
+    _keys_to_ignore_on_load_missing = [r"position_ids"]
+
+    def __init__(self, config):
+        super().__init__(config)
+        self.num_labels = 2
+        self.config = config
+        self.config.num_labels = 2
+        self.config.problem_type = "single_label_classification"
+
+        self.oldtreeformer = OldTreeformerModel(self.config, add_pooling_layer=False)
+        self.classifier = OldTreeformerClassificationHead(self.config)
+
+        # Initialize weights and apply final processing
+        self.post_init()
+
+    @add_start_docstrings_to_model_forward(OLDTREEFORMER_INPUTS_DOCSTRING.format("batch_size, sequence_length"))
+    @add_code_sample_docstrings(
+        checkpoint="cardiffnlp/twitter--emotion",
+        output_type=SequenceClassifierOutput,
+        config_class=_CONFIG_FOR_DOC,
+        expected_output="'optimism'",
+        expected_loss=0.08,
+    )
+    def forward(
+        self,
+        input_ids: Optional[torch.LongTensor] = None,
+        attention_mask: Optional[torch.FloatTensor] = None,
+        token_type_ids: Optional[torch.LongTensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        head_mask: Optional[torch.FloatTensor] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        labels: Optional[torch.LongTensor] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+    ) -> Union[Tuple[torch.Tensor], SequenceClassifierOutput]:
+        r"""
+        labels (`torch.LongTensor` of shape `(batch_size,)`, *optional*):
+            Labels for computing the sequence classification/regression loss. Indices should be in `[0, ...,
+            config.num_labels - 1]`. If `config.num_labels == 1` a regression loss is computed (Mean-Square loss), If
+            `config.num_labels > 1` a classification loss is computed (Cross-Entropy).
+        """
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        outputs = self.oldtreeformer(
+            input_ids,
+            attention_mask=attention_mask,
+            token_type_ids=token_type_ids,
+            position_ids=position_ids,
+            head_mask=head_mask,
+            inputs_embeds=inputs_embeds,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+        )
+        tree_output = outputs[0]
+        N = input_ids.size(1)  # type:ignore
+        H = self.config.max_height
+        logits = self.classifier(tree_output, N, H)
+
+        loss = None
+        if labels is not None:
+            # move labels to correct device to enable model parallelism
+            labels: torch.Tensor = labels.to(logits.device)
+            loss_fct = CrossEntropyLoss()
+            loss = loss_fct(logits.view(-1, self.num_labels), labels.view(-1))
+
+        if not return_dict:
+            output = (logits,) + outputs[2:]
+            return ((loss,) + output) if loss is not None else output
+
+        return SequenceClassifierOutput(
+            loss=loss,
+            logits=logits,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+        )
 
 
 @add_start_docstrings(

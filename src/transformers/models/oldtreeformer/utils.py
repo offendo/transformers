@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 
 import sys
-from typing import Tuple
+from typing import Optional, Tuple
 import math
 
 import torch
@@ -14,10 +14,14 @@ def pprint(tree, N, H):
     else:
         formatter = lambda x: f"{x:<3}"
         indenter = lambda i: " " * 3 * i
+
+    to_print = []
     for idx, row_len in enumerate(range(N, max(N - H, 0), -1)):
         row = tree[start_idx:start_idx+row_len]
-        print(indenter(idx) + (indenter(1)).join(map(formatter, row)))
+        to_print.append((indenter(1)).join(map(formatter, row)))
         start_idx += row_len
+
+    print(*to_print[::-1], sep='\n')
 
 
 def inverse_tri(W: int, H: int):
@@ -63,7 +67,7 @@ def get_coord_from_idx(N: int, idx):
     return (row, col)
 
 
-def make_tree_pad_mask(seq_mask: torch.Tensor, H: int) -> torch.Tensor:
+def make_tree_pad_mask(seq_mask: torch.Tensor, H: int, split_at: Optional[torch.Tensor] = None) -> torch.Tensor:
     """Create padding mask for tree from base sequence
 
     Parameters
@@ -83,6 +87,22 @@ def make_tree_pad_mask(seq_mask: torch.Tensor, H: int) -> torch.Tensor:
     for row in range(1, min(N, H)):
         start, end = get_row_idxs(N, row)
         tree_mask[:, start:end] = seq_mask[:, row:]
+
+    # TODO figure out how to make the mask. I think you can use get_row_idxs to get
+    # [first_seq_start, first_seq_end] and [sec_seq_start, sec_seq_end], and then just
+    # mask out the part between [first_seq_end, sec_seq_start]
+
+    # NOTE Above has been solved I think. This logic should do it.
+
+    if split_at is not None:
+        for b in range(B):
+            l1 = int(split_at[b].item())
+            for row in range(1, min(N, H)):
+                row_len_1 = l1 - row
+                start1, end1 = get_row_idxs(N, row)
+
+                # Mask out the in-between part
+                tree_mask[b, start1+row_len_1:start1+l1] = True
 
     return tree_mask
 
