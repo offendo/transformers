@@ -47,6 +47,7 @@ from transformers import (
     HfArgumentParser,
     Trainer,
     TrainingArguments,
+    TrainerCallback,
     is_torch_tpu_available,
     set_seed,
     DataCollatorWithPadding,
@@ -78,56 +79,17 @@ class MaxTokensDataset(IterableDataset):
         if batch_start_idx < len(self.dataset):
             yield self.dataset[batch_start_idx:]
 
-class BatchlessTrainer(Trainer):
-    def get_train_dataloader(self):
-        """
-        Returns the training [`~torch.utils.data.DataLoader`].
+class FreezeAfterSteps(TrainerCallback):
+    def __init__(self, freeze_steps):
+        self.freeze_steps = freeze_steps
 
-        Will use no sampler if `train_dataset` does not implement `__len__`, a random sampler (adapted to distributed
-        training if necessary) otherwise.
-
-        Subclass and override this method if you want to inject some custom behavior.
-        """
-        if self.train_dataset is None:
-            raise ValueError("Trainer: training requires a train_dataset.")
-
-        train_dataset = self.train_dataset
-        data_collator = self.data_collator
-        if is_datasets_available() and isinstance(train_dataset, datasets.Dataset):
-            train_dataset = self._remove_unused_columns(train_dataset, description="training")
-        else:
-            data_collator = self._get_collator_with_removed_columns(data_collator, description="training")
-
-        if isinstance(train_dataset, torch.utils.data.IterableDataset):
-            if self.args.world_size > 1:
-                train_dataset = IterableDatasetShard(
-                    train_dataset,
-                    batch_size=None,
-                    drop_last=self.args.dataloader_drop_last,
-                    num_processes=self.args.world_size,
-                    process_index=self.args.process_index,
-                )
-
-            return DataLoader(
-                train_dataset,
-                batch_size=None,
-                collate_fn=data_collator,
-                num_workers=self.args.dataloader_num_workers,
-                pin_memory=self.args.dataloader_pin_memory,
-            )
-
-        train_sampler = self._get_train_sampler()
-
-        return DataLoader(
-            train_dataset,
-            batch_size=None,
-            sampler=train_sampler,
-            collate_fn=data_collator,
-            drop_last=self.args.dataloader_drop_last,
-            num_workers=self.args.dataloader_num_workers,
-            pin_memory=self.args.dataloader_pin_memory,
-            worker_init_fn=seed_worker,
-        )
+    def on_step_begin(self, args, state, control, model, **kwargs):
+        if state.global_step == self.freeze_steps:
+            for name, param in model.oldtreeformer.embeddings.named_parameters():
+                param.requires_grad = False
+            for name, param in model.oldtreeformer.encoder.named_parameters():
+                param.requires_grad = False
+            logger.info(f'Reached step {state.global_step}; froze encoder layers)')
 
 # Will error if the minimal version of Transformers is not installed. Remove at your own risks.
 check_min_version("4.29.0.dev0")
@@ -157,9 +119,9 @@ class ModelArguments:
         default=None,
         metadata={"help": "If present, will use Treeformer instead of the model given."},
     )
-    freeze_encoder: Optional[bool] = field(
+    freeze_after_steps: Optional[int] = field(
         default=None,
-        metadata={"help": "If present, will freeze the weights of the encoder"},
+        metadata={"help": "If present, will freeze encoder weights after N steps."},
     )
     model_type: Optional[str] = field(
         default=None,
@@ -484,15 +446,6 @@ def main():
             config.num_labels = 2
             model = OldTreeformerForSequenceClassification(config)
             model.oldtreeformer.load_state_dict(torch.load('./roberta-weights.pt'), strict=False)
-            if model_args.freeze_encoder:
-                names = []
-                for name, param in model.oldtreeformer.embeddings.named_parameters():
-                    names.append(name)
-                    param.requires_grad = False
-                for name, param in model.oldtreeformer.encoder.named_parameters():
-                    names.append(name)
-                    param.requires_grad = False
-                logger.info(f'Froze layers: {names})')
 
         else:
             config.num_labels = 2
@@ -645,10 +598,6 @@ def main():
         max_length=data_args.max_seq_length,
     )
 
-    # if data_args.max_tokens_per_batch is not None:
-    #     train_dataset = MaxTokensDataset(train_dataset, data_args.max_tokens_per_batch)
-    #     eval_dataset = MaxTokensDataset(eval_dataset, data_args.max_tokens_per_batch)
-
     # Initialize our Trainer
     trainer = Trainer(
         model=model,
@@ -662,6 +611,9 @@ def main():
         if training_args.do_eval and not is_torch_tpu_available()
         else None,
     )
+
+    if model_args.freeze_after_steps:
+        trainer.add_callback(FreezeAfterSteps(model_args.freeze_after_steps))
 
     # Training
     if training_args.do_train:
