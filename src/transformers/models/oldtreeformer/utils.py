@@ -8,16 +8,18 @@ import torch
 
 def pprint(tree, N, H):
     start_idx = 0
-    if math.log10(max(tree)) < 2:
-        formatter = lambda x: f"{x:<2}"
-        indenter = lambda i: " " * 2 * i
-    else:
-        formatter = lambda x: f"{x:<3}"
-        indenter = lambda i: " " * 3 * i
+    formatter = lambda x: f"{x:0.2f}"
+    indenter = lambda i: " "
+    # if math.log10(max(tree)) < 2:
+    #     formatter = lambda x: f"{x:<2}"
+    #     indenter = lambda i: "" * 2 * i
+    # else:
+    #     formatter = lambda x: f"{x:<3}"
+    #     indenter = lambda i: "" * 3 * i
 
     to_print = []
     for idx, row_len in enumerate(range(N, max(N - H, 0), -1)):
-        row = tree[start_idx:start_idx+row_len]
+        row = tree.cpu().tolist()[start_idx:start_idx+row_len]
         to_print.append((indenter(1)).join(map(formatter, row)))
         start_idx += row_len
 
@@ -73,12 +75,14 @@ def make_tree_pad_mask(seq_mask: torch.Tensor, H: int, split_at: Optional[torch.
     Parameters
     ----------
     seq_mask : torch.Tensor, shape `[B, N]`
-        Mask for some sequence, where `False` indicates padding
+        Mask for some sequence, where `True` indicates padding. Note that PyTorch wants True =
+        padding, but huggingface wants False = padding. Make sure you know which one this is being
+        used for.
 
     Returns
     -------
     torch.Tensor, shape `[B, tri(N)]`:
-        Padding mask for tree (`True` -> padding)
+        Padding mask for tree (`False` -> padding)
     """
     B, N = seq_mask.shape
     W = get_tree_width(N, H)
@@ -88,11 +92,15 @@ def make_tree_pad_mask(seq_mask: torch.Tensor, H: int, split_at: Optional[torch.
         start, end = get_row_idxs(N, row)
         tree_mask[:, start:end] = seq_mask[:, row:]
 
-    # TODO figure out how to make the mask. I think you can use get_row_idxs to get
-    # [first_seq_start, first_seq_end] and [sec_seq_start, sec_seq_end], and then just
-    # mask out the part between [first_seq_end, sec_seq_start]
-
-    # NOTE Above has been solved I think. This logic should do it.
+    # If the input was actually a sentence pair, we want to split the two sentences in half to
+    # encode them separately. In practice, we can do this by just encoding them together and
+    # masking out the nodes which span both sentences. For example, if 0s are the first
+    # sentence and 1s are the second, we'd want the following tree structure to be built.
+    # 0 . . . 1 . . .
+    # 0 0 . . 1 1 . .
+    # 0 0 0 . 1 1 1 .
+    # 0 0 0 0 1 1 1 1
+    # where . represents padding
 
     if split_at is not None:
         for b in range(B):

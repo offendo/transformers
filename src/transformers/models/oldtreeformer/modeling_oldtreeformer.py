@@ -62,34 +62,17 @@ OLDTREEFORMER_PRETRAINED_MODEL_ARCHIVE_LIST = [
 
 
 class TreeBuilder(nn.Module):
-    """Treeformer module. Constructs a tree-like structure over an input text via a CKY-style encoding algorithm
-
-    Attributes
-    ----------
-    max_height : int
-
-    Submodules
-    ----------
-    attn : MultiheadAttention
-    combiner : nn.Linear
-    dropout : nn.Dropout
-    ff : nn.Sequential
-        - Linear -> ReLU -> Dropout -> Linear
-    norm_1, norm_2, norm_3 : nn.LayerNorm
-
-    """
-
     def __init__(self, config):
         super().__init__()
 
         hidden_dim = config.hidden_size
         intermediate_dim = config.intermediate_size
-        dropout = config.hidden_dropout_prob
+        dropout = 0 # config.hidden_dropout_prob
         attn_dropout = config.attention_probs_dropout_prob
         self.max_height = config.max_height
-        self.save_attn = getattr(config, "save_attn", False)
-        if self.save_attn:
-            Path(self.save_attn).mkdir(exist_ok=True, parents=True)
+        # self.save_attn = getattr(config, "save_attn", False)
+        # if self.save_attn:
+        #     Path(self.save_attn).mkdir(exist_ok=True, parents=True)
 
         # Encoder
         self.vp = nn.Parameter(torch.normal(mean=0.0, std=0.02, size=(hidden_dim,)))
@@ -128,11 +111,10 @@ class TreeBuilder(nn.Module):
 
         # first row of the tree is transformer'd embeddings
         tree[:, :N, :] = embeddings
-        tree_mask = make_tree_pad_mask(mask, H=self.max_height, split_at=split_sentences_at)
 
         # Encode cells from the bottom up
-        all_weights = []
-        all_masks = []
+        # all_weights = []
+        # all_masks = []
         for row in range(1, min(N, self.max_height)):
             # make attention mask
             row_len = N - row
@@ -140,20 +122,21 @@ class TreeBuilder(nn.Module):
             attn_mask = ~torch.block_diag(*[ones for _ in range(row_len)])
 
             left, right = self.get_children(tree, row, N)
-            row_output = self.encode_row(row_len, left, right, attn_mask)
             start, end = get_row_idxs(N, row)
-            tree[:, start:end, :] = row_output[0]
-            if self.save_attn:
-                all_weights.append(row_output[1].detach().cpu().numpy())
-                all_masks.append(attn_mask.detach().cpu().numpy())
+            row_output = self.encode_row(row_len, left, right, attn_mask)
+            tree[:, start:end, :] = row_output
+            # if self.save_attn:
+            #     all_weights.append(row_output[1].detach().cpu().numpy())
+            #     all_masks.append(attn_mask.detach().cpu().numpy())
 
         # zero out the padding items
-        tree = tree * tree_mask.unsqueeze(-1)
+        tree_mask = make_tree_pad_mask(mask, H=self.max_height, split_at=split_sentences_at)
+        tree = tree * (tree_mask).unsqueeze(-1)
 
-        if self.save_attn:
-            with open(f"./weights-and-masks/{self.batch_idx}.pt", "wb") as f:
-                pickle.dump((all_weights, all_masks, src_tokens), f)
-            self.batch_idx += 1
+        # if self.save_attn:
+        #     with open(f"./weights-and-masks/{self.batch_idx}.pt", "wb") as f:
+        #         pickle.dump((all_weights, all_masks, src_tokens), f)
+        #     self.batch_idx += 1
 
         return {
             "tree": tree,
@@ -177,22 +160,23 @@ class TreeBuilder(nn.Module):
         # norm + attn + dropout + add
         src = self.vp.view(1, 1, -1).expand(B, out_len, -1)  # shape b, l, d
         pairs = self.norm_2(pairs)
-        attn, weights = self.attn(
+        attn, _ = self.attn(
             query=src,
             key=pairs,
             value=pairs,
             key_padding_mask=None,
             attn_mask=attn_mask,
-            need_weights=True,
+            need_weights=False,
         )
         src = src + self.dropout(attn)
 
         # norm + (ff + dropout) + add
         src = self.norm_3(src)
         src = src + self.ff(src)
-        if self.save_attn:
-            # weights will be [B, row_len]
-            return (src, weights)
+
+        # if self.save_attn:
+        #     weights will be [B, row_len]
+        #     return (src, weights)
         return src
 
     def combine(self, v: torch.Tensor, u: torch.Tensor) -> torch.Tensor:
@@ -990,21 +974,6 @@ class OldTreeformerModel(OldTreeformerPreTrainedModel):
             else:
                 token_type_ids = torch.zeros(input_shape, dtype=torch.long, device=device)
 
-        # We can provide a self-attention mask of dimensions [batch_size, from_seq_length, to_seq_length]
-        # ourselves in which case we just need to make it broadcastable to all heads.
-        extended_attention_mask: torch.Tensor = self.get_extended_attention_mask(attention_mask, input_shape)
-
-        # If a 2D or 3D attention mask is provided for the cross-attention
-        # we need to make broadcastable to [batch_size, num_heads, seq_length, seq_length]
-        if self.config.is_decoder and encoder_hidden_states is not None:
-            encoder_batch_size, encoder_sequence_length, _ = encoder_hidden_states.size()
-            encoder_hidden_shape = (encoder_batch_size, encoder_sequence_length)
-            if encoder_attention_mask is None:
-                encoder_attention_mask = torch.ones(encoder_hidden_shape, device=device)
-            encoder_extended_attention_mask = self.invert_attention_mask(encoder_attention_mask)
-        else:
-            encoder_extended_attention_mask = None
-
         # Prepare head mask if needed
         # 1.0 in head_mask indicate we keep the head
         # attention_probs has shape bsz x n_heads x N x N
@@ -1019,6 +988,22 @@ class OldTreeformerModel(OldTreeformerPreTrainedModel):
             inputs_embeds=inputs_embeds,
             past_key_values_length=past_key_values_length,
         )
+        # We can provide a self-attention mask of dimensions [batch_size, from_seq_length, to_seq_length]
+        # ourselves in which case we just need to make it broadcastable to all heads.
+        dtype = embedding_output.dtype
+        extended_attention_mask: torch.Tensor = self.get_extended_attention_mask(attention_mask, input_shape, dtype=dtype)
+
+        # If a 2D or 3D attention mask is provided for the cross-attention
+        # we need to make broadcastable to [batch_size, num_heads, seq_length, seq_length]
+        if self.config.is_decoder and encoder_hidden_states is not None:
+            encoder_batch_size, encoder_sequence_length, _ = encoder_hidden_states.size()
+            encoder_hidden_shape = (encoder_batch_size, encoder_sequence_length)
+            if encoder_attention_mask is None:
+                encoder_attention_mask = torch.ones(encoder_hidden_shape, device=device)
+            encoder_extended_attention_mask = self.invert_attention_mask(encoder_attention_mask)
+        else:
+            encoder_extended_attention_mask = None
+
         encoder_outputs = self.encoder(
             embedding_output,
             attention_mask=extended_attention_mask,
@@ -1033,17 +1018,6 @@ class OldTreeformerModel(OldTreeformerPreTrainedModel):
         )
 
         sequence_output = encoder_outputs[0]  # [B, N, D]
-
-        # If the input was actually a sentence pair, we want to split the two sentences in half to
-        # encode them separately. In practice, we can do this by just encoding them together and
-        # masking out the nodes which span both sentences. For example, if 0s are the first
-        # sentence and 1s are the second, we'd want the following tree structure to be built.
-        # 0 . . . 1 . . .
-        # 0 0 . . 1 1 . .
-        # 0 0 0 . 1 1 1 .
-        # 0 0 0 0 1 1 1 1
-        # where . represents padding
-        new_attn_mask = torch.zeros_like(attention_mask, device=attention_mask.device)
 
         tree_output = self.tree_builder(sequence_output, attention_mask, None, split_sentences_at)["tree"]
         pooled_output = self.pooler(tree_output) if self.pooler is not None else None
@@ -1660,12 +1634,34 @@ class OldTreeformerClassificationHead(nn.Module):
         )
         self.dropout = nn.Dropout(classifier_dropout)
         self.out_proj = nn.Linear(config.hidden_size, config.num_labels)
-        self.pool_cls_and_top = getattr(config, "pool_cls_and_top", False)
+        self.pool_cls_and_top = False#  getattr(config, "pool_cls_and_top", False)
 
-    def forward(self, features, N, H, **kwargs):
-        height = min(H, N)
-        top_row_start_idx = tri(N) - tri(N - height + 1)
-        x = torch.mean(features[:, top_row_start_idx:, :], dim=1)
+    def forward(self, features, N, H, split_at=None, **kwargs):
+
+        # TODO This branch is unfinished
+        if split_at is not None:
+            raise NotImplementedError(
+                "Haven't finished this branch yet; minor case where one of the two sentences is under 10 tokens"
+            )
+            B = features.size(0)
+            for b in range(B):
+                n1 = split_at[b]
+                h1 = min(H, n1)
+                h2 = min(H, n2)
+
+                r1 = h1 - 1
+                r2 = h2 - 1
+
+                start1, end1 = get_row_idxs(n1, r1)
+                start2, end2 = get_row_idxs(n2, r2)
+
+                x1 = features[:, start1:end1, :]
+                x2 = features[:, start2+n1:,:]
+                x = torch.mean(x1, dim=1) + torch.mean(x2, dim=1)
+        else:
+            height = min(H, N)
+            start = tri(N) - tri(N - height + 1)
+            x = torch.mean(features[:, start:, :], dim=1)
 
         if self.pool_cls_and_top:
             x = x + features[:, 0, :]
@@ -1694,14 +1690,6 @@ class OldTreeformerForSentenceOrderPrediction(OldTreeformerPreTrainedModel):
         # Initialize weights and apply final processing
         self.post_init()
 
-    @add_start_docstrings_to_model_forward(OLDTREEFORMER_INPUTS_DOCSTRING.format("batch_size, sequence_length"))
-    @add_code_sample_docstrings(
-        checkpoint="cardiffnlp/twitter--emotion",
-        output_type=SequenceClassifierOutput,
-        config_class=_CONFIG_FOR_DOC,
-        expected_output="'optimism'",
-        expected_loss=0.08,
-    )
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
@@ -1714,6 +1702,7 @@ class OldTreeformerForSentenceOrderPrediction(OldTreeformerPreTrainedModel):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
+        split_sentences_at: Optional[torch.LongTensor] = None,
     ) -> Union[Tuple[torch.Tensor], SequenceClassifierOutput]:
         r"""
         labels (`torch.LongTensor` of shape `(batch_size,)`, *optional*):
@@ -1733,6 +1722,7 @@ class OldTreeformerForSentenceOrderPrediction(OldTreeformerPreTrainedModel):
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
+            split_sentences_at=split_sentences_at,
         )
         tree_output = outputs[0]
         N = input_ids.size(1)  # type:ignore

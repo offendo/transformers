@@ -405,7 +405,7 @@ def main():
             pool_cls_and_top=model_args.pool_cls_and_top,
         )
         model = OldTreeformerForSequenceClassification(config)
-        missing, unexp = model.oldtreeformer.load_state_dict(torch.load('./roberta-weights.pt'), strict=False)
+        missing, unexp = model.load_state_dict(torch.load('./roberta-weights.pt'), strict=False)
         print(f'Missing these weights from state dict: {missing}')
     else:
         model = AutoModelForSequenceClassification.from_pretrained(

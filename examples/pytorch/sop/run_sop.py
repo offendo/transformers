@@ -31,6 +31,8 @@ from typing import Optional
 
 import datasets
 import evaluate
+import torch
+from torch.utils.data import Dataset, IterableDataset, DataLoader
 from datasets import load_dataset, load_from_disk
 
 import transformers
@@ -40,6 +42,7 @@ from transformers import (
     AutoConfig,
     AutoModelForMaskedLM,
     AutoModelForNextSentencePrediction,
+    AutoModelForSequenceClassification,
     AutoTokenizer,
     HfArgumentParser,
     Trainer,
@@ -47,13 +50,84 @@ from transformers import (
     is_torch_tpu_available,
     set_seed,
     DataCollatorWithPadding,
+    OldTreeformerConfig,
+    OldTreeformerForSequenceClassification,
 )
-from transformers.data.data_collator import DataCollatorForSOP
-from transformers.models.oldtreeformer.modeling_oldtreeformer import OldTreeformerForSentenceOrderPrediction
-from transformers.trainer_utils import get_last_checkpoint
-from transformers.utils import check_min_version, send_example_telemetry
+from transformers.trainer_utils import get_last_checkpoint, seed_worker
+from transformers.trainer_pt_utils import IterableDatasetShard
+from transformers.utils import check_min_version, send_example_telemetry, is_datasets_available
 from transformers.utils.versions import require_version
 
+class MaxTokensDataset(IterableDataset):
+    def __init__(self, dataset, max_tokens_per_batch):
+        self.dataset = dataset
+        self.max_tokens_per_batch = max_tokens_per_batch
+
+    def __iter__(self):
+        batch_start_idx = 0
+        max_example_len = 0
+        for idx, example in enumerate(self.dataset):
+            tokens_in_example = len(example["input_ids"])
+            max_example_len = max(max_example_len, tokens_in_example)
+            examples_so_far = idx - batch_start_idx
+            # check if we have room for one more. If not, yield batch without example
+            if max_example_len * (examples_so_far + 1) > self.max_tokens_per_batch:
+                yield self.dataset[batch_start_idx:idx]
+                batch_start_idx = idx - 1
+                max_example_len = tokens_in_example
+        if batch_start_idx < len(self.dataset):
+            yield self.dataset[batch_start_idx:]
+
+class BatchlessTrainer(Trainer):
+    def get_train_dataloader(self):
+        """
+        Returns the training [`~torch.utils.data.DataLoader`].
+
+        Will use no sampler if `train_dataset` does not implement `__len__`, a random sampler (adapted to distributed
+        training if necessary) otherwise.
+
+        Subclass and override this method if you want to inject some custom behavior.
+        """
+        if self.train_dataset is None:
+            raise ValueError("Trainer: training requires a train_dataset.")
+
+        train_dataset = self.train_dataset
+        data_collator = self.data_collator
+        if is_datasets_available() and isinstance(train_dataset, datasets.Dataset):
+            train_dataset = self._remove_unused_columns(train_dataset, description="training")
+        else:
+            data_collator = self._get_collator_with_removed_columns(data_collator, description="training")
+
+        if isinstance(train_dataset, torch.utils.data.IterableDataset):
+            if self.args.world_size > 1:
+                train_dataset = IterableDatasetShard(
+                    train_dataset,
+                    batch_size=None,
+                    drop_last=self.args.dataloader_drop_last,
+                    num_processes=self.args.world_size,
+                    process_index=self.args.process_index,
+                )
+
+            return DataLoader(
+                train_dataset,
+                batch_size=None,
+                collate_fn=data_collator,
+                num_workers=self.args.dataloader_num_workers,
+                pin_memory=self.args.dataloader_pin_memory,
+            )
+
+        train_sampler = self._get_train_sampler()
+
+        return DataLoader(
+            train_dataset,
+            batch_size=None,
+            sampler=train_sampler,
+            collate_fn=data_collator,
+            drop_last=self.args.dataloader_drop_last,
+            num_workers=self.args.dataloader_num_workers,
+            pin_memory=self.args.dataloader_pin_memory,
+            worker_init_fn=seed_worker,
+        )
 
 # Will error if the minimal version of Transformers is not installed. Remove at your own risks.
 check_min_version("4.29.0.dev0")
@@ -78,6 +152,14 @@ class ModelArguments:
                 "The model checkpoint for weights initialization. Don't set if you want to train a model from scratch."
             )
         },
+    )
+    treeformer: Optional[bool] = field(
+        default=None,
+        metadata={"help": "If present, will use Treeformer instead of the model given."},
+    )
+    freeze_encoder: Optional[bool] = field(
+        default=None,
+        metadata={"help": "If present, will freeze the weights of the encoder"},
     )
     model_type: Optional[str] = field(
         default=None,
@@ -174,6 +256,10 @@ class DataTrainingArguments:
             )
         },
     )
+    max_tokens_per_batch: Optional[int] = field(
+        default=None,
+        metadata={ "help": "Maximum total tokens per batch (set batch size to 1)" },
+    )
     preprocessing_num_workers: Optional[int] = field(
         default=None,
         metadata={"help": "The number of processes to use for the preprocessing."},
@@ -211,7 +297,7 @@ class DataTrainingArguments:
     )
 
     def __post_init__(self):
-        if self.dataset_name is None and self.train_file is None and self.validation_file is None:
+        if self.dataset_name is None and self.train_file is None and self.validation_file is None and self.dataset_path is None:
             raise ValueError("Need either a dataset name or a training/validation file.")
         else:
             if self.train_file is not None:
@@ -374,6 +460,9 @@ def main():
             config.update_from_string(model_args.config_overrides)
             logger.info(f"New config: {config}")
 
+    if model_args.treeformer:
+        config = OldTreeformerConfig.from_pretrained('roberta-base', **config_kwargs)
+
     tokenizer_kwargs = {
         "cache_dir": model_args.cache_dir,
         "use_fast": model_args.use_fast_tokenizer,
@@ -392,17 +481,22 @@ def main():
 
     if model_args.model_name_or_path:
         if model_args.treeformer:
-            model = OldTreeformerForSentenceOrderPrediction.from_pretrained(
-                model_args.model_name_or_path,
-                from_tf=bool(".ckpt" in model_args.model_name_or_path),
-                config=config,
-                cache_dir=model_args.cache_dir,
-                revision=model_args.model_revision,
-                use_auth_token=True if model_args.use_auth_token else None,
-                low_cpu_mem_usage=model_args.low_cpu_mem_usage,
-            )
+            config.num_labels = 2
+            model = OldTreeformerForSequenceClassification(config)
+            model.oldtreeformer.load_state_dict(torch.load('./roberta-weights.pt'), strict=False)
+            if model_args.freeze_encoder:
+                names = []
+                for name, param in model.oldtreeformer.embeddings.named_parameters():
+                    names.append(name)
+                    param.requires_grad = False
+                for name, param in model.oldtreeformer.encoder.named_parameters():
+                    names.append(name)
+                    param.requires_grad = False
+                logger.info(f'Froze layers: {names})')
+
         else:
-            model = AutoModelForNextSentencePrediction.from_pretrained(
+            config.num_labels = 2
+            model = AutoModelForSequenceClassification.from_pretrained(
                 model_args.model_name_or_path,
                 from_tf=bool(".ckpt" in model_args.model_name_or_path),
                 config=config,
@@ -410,7 +504,10 @@ def main():
                 revision=model_args.model_revision,
                 use_auth_token=True if model_args.use_auth_token else None,
                 low_cpu_mem_usage=model_args.low_cpu_mem_usage,
+                torch_dtype=torch.float32,
             )
+
+        # freeze layers if desired
     else:
         raise ValueError(
             "You are training a new model from scratch. This is not supported by this script."
@@ -452,35 +549,40 @@ def main():
     # Otherwise, we tokenize every text, then concatenate them together before splitting them in smaller parts.
     # We use `return_special_tokens_mask=True` because DataCollatorForLanguageModeling (see below) is more
     # efficient when it receives the `special_tokens_mask`.
-    def tokenize_function(examples):
-        return tokenizer(examples[text_pair_column_name], return_special_tokens_mask=True)
+    if 'input_ids' in raw_datasets['train'][0]:
+        logger.info('Dataset already tokenized')
+        tokenized_datasets = raw_datasets
+    else:
+        def tokenize_function(examples):
+            return tokenizer(examples[text_pair_column_name], return_special_tokens_mask=True)
+        
+        with training_args.main_process_first(desc="dataset map tokenization"):
+            tokenized_datasets = raw_datasets.map(
+                tokenize_function,
+                batched=True,
+                num_proc=data_args.preprocessing_num_workers,
+                remove_columns=column_names,
+                load_from_cache_file=not data_args.overwrite_cache,
+                desc="Running tokenizer on every text in dataset",
+            )
 
-    with training_args.main_process_first(desc="dataset map tokenization"):
-        tokenized_datasets = raw_datasets.map(
-            tokenize_function,
-            batched=True,
-            num_proc=data_args.preprocessing_num_workers,
-            remove_columns=column_names,
-            load_from_cache_file=not data_args.overwrite_cache,
-            desc="Running tokenizer on every text in dataset",
-        )
 
     # Main data processing function that will concatenate all texts from our dataset and generate chunks of
     # max_seq_length.
-    def group_texts(examples):
-        # Concatenate all texts.
-        concatenated_examples = {k: list(chain(*examples[k])) for k in examples.keys()}
-        total_length = len(concatenated_examples[list(examples.keys())[0]])
-        # We drop the small remainder, we could add padding if the model supported it instead of this drop, you can
-        # customize this part to your needs.
-        if total_length >= max_seq_length:
-            total_length = (total_length // max_seq_length) * max_seq_length
-        # Split by chunks of max_len.
-        result = {
-            k: [t[i : i + max_seq_length] for i in range(0, total_length, max_seq_length)]
-            for k, t in concatenated_examples.items()
-        }
-        return result
+    # def group_texts(examples):
+    #     # Concatenate all texts.
+    #     concatenated_examples = {k: list(chain(*examples[k])) for k in examples.keys()}
+    #     total_length = len(concatenated_examples[list(examples.keys())[0]])
+    #     # We drop the small remainder, we could add padding if the model supported it instead of this drop, you can
+    #     # customize this part to your needs.
+    #     if total_length >= max_seq_length:
+    #         total_length = (total_length // max_seq_length) * max_seq_length
+    #     # Split by chunks of max_len.
+    #     result = {
+    #         k: [t[i : i + max_seq_length] for i in range(0, total_length, max_seq_length)]
+    #         for k, t in concatenated_examples.items()
+    #     }
+    #     return result
 
     # Note that with `batched=True`, this map processes 1,000 texts together, so group_texts throws away a
     # remainder for each of those groups of 1,000 texts. You can adjust that batch_size here but a higher value
@@ -489,14 +591,14 @@ def main():
     # To speed up this part, we use multiprocessing. See the documentation of the map method for more information:
     # https://huggingface.co/docs/datasets/package_reference/main_classes.html#datasets.Dataset.map
 
-    with training_args.main_process_first(desc="grouping texts together"):
-        tokenized_datasets = tokenized_datasets.map(
-            group_texts,
-            batched=True,
-            num_proc=data_args.preprocessing_num_workers,
-            load_from_cache_file=not data_args.overwrite_cache,
-            desc=f"Grouping texts in chunks of {max_seq_length}",
-        )
+    # with training_args.main_process_first(desc="grouping texts together"):
+    #     tokenized_datasets = tokenized_datasets.map(
+    #         group_texts,
+    #         batched=True,
+    #         num_proc=data_args.preprocessing_num_workers,
+    #         load_from_cache_file=not data_args.overwrite_cache,
+    #         desc=f"Grouping texts in chunks of {max_seq_length}",
+    #     )
 
     if training_args.do_train:
         if "train" not in tokenized_datasets:
@@ -540,7 +642,12 @@ def main():
     data_collator = DataCollatorWithPadding(
         tokenizer=tokenizer,
         pad_to_multiple_of=8 if pad_to_multiple_of_8 else None,
+        max_length=data_args.max_seq_length,
     )
+
+    # if data_args.max_tokens_per_batch is not None:
+    #     train_dataset = MaxTokensDataset(train_dataset, data_args.max_tokens_per_batch)
+    #     eval_dataset = MaxTokensDataset(eval_dataset, data_args.max_tokens_per_batch)
 
     # Initialize our Trainer
     trainer = Trainer(
